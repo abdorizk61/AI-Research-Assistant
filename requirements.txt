@@ -1,0 +1,3 @@
+gradio
+chromadb
+langchain-text-splitters
