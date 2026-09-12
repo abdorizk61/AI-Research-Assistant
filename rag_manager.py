@@ -233,6 +233,44 @@ class RAGManager:
 
         return formatted_results
 
+    def retrieve_relevant_context(
+        self,
+        query: str,
+        k: int = 3,
+        distance_threshold: float = 0.8,
+        allowed_sources: List[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve chunks that pass a similarity cutoff.
+
+        Returns an empty list when the knowledge base is empty, every hit
+        is farther than `distance_threshold`, or (when provided) no hit
+        comes from `allowed_sources`. Callers must not send leftover
+        unmatched chunks to the LLM.
+        """
+        if not query or not query.strip():
+            return []
+
+        if self.collection.count() == 0:
+            logger.warning("retrieve_relevant_context called but the knowledge base is empty.")
+            return []
+
+        results = self.retrieve_context(query, k=k)
+        relevant = [
+            item for item in results
+            if item.get("distance", float("inf")) <= distance_threshold
+        ]
+
+        if allowed_sources:
+            allowed = {source.strip() for source in allowed_sources if source and str(source).strip()}
+            if allowed:
+                relevant = [
+                    item for item in relevant
+                    if item.get("source", "") in allowed
+                ]
+
+        return relevant
+
     # ------------------------------------------------------------------
     # Small utility helpers (not required, but handy for the UI)
     # ------------------------------------------------------------------
@@ -240,12 +278,20 @@ class RAGManager:
         """Total number of chunks currently stored (useful for UI status)."""
         return self.collection.count()
 
+    def is_empty(self) -> bool:
+        return self.collection.count() == 0
+
     def reset_knowledge_base(self) -> None:
         """Deletes and recreates the collection. Use with caution."""
-        self.client.delete_collection(self.collection_name)
+        try:
+            self.client.delete_collection(self.collection_name)
+        except Exception as error:
+            logger.warning(f"Could not delete collection '{self.collection_name}': {error}")
+
         self.collection = self.client.get_or_create_collection(
             name=self.collection_name,
             embedding_function=self.embedding_function,
+            metadata={"description": "AI Research Assistant knowledge base"},
         )
         logger.info("Knowledge base has been reset.")
 

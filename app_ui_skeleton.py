@@ -1,209 +1,335 @@
 """
-AI Research Assistant — Gradio UI Skeleton
-============================================
-
-Scope of this file (Step 1 of the project):
-    - Gradio Blocks layout only.
-    - Dummy/placeholder handler functions that demonstrate status
-      indicators (gr.Info / gr.Progress) and the expected function
-      signatures.
-    - NO RAG pipeline, NO LangChain, NO ChromaDB, NO Ollama calls yet.
-
-Why it's structured this way:
-    - Each "real" piece of logic (search, scrape, RAG retrieval, LLM
-      call) is isolated into its own placeholder function with a
-      clear docstring describing what it will do later. In the next
-      steps we simply replace the body of these functions — the UI
-      wiring (inputs/outputs/events) does not need to change.
-    - `gr.State` holds the chat history so it survives across turns
-      without relying on global variables (important once we deploy
-      or run multiple concurrent users).
+AI Research Assistant — Gradio UI (Integrated: RAG + Agent)
+=============================================================
+- Modern Gradio 6.x messages format for Chatbot
+- Robust UI-level Try/Except error handling
+- ChromaDB RAG integration with distance threshold fallback
+- W3Schools Green Theme styling
 """
 
-import time
+import traceback
 import gradio as gr
+
+from rag_manager import RAGManager
+import main as agent_backend
 
 
 # ---------------------------------------------------------------------------
-# 1. PLACEHOLDER / DUMMY BACKEND FUNCTIONS
-#    These will be replaced with real RAG + Ollama logic in later steps.
-#    Keeping them separate keeps the UI code decoupled from the logic.
+# 0. CONFIG & THEME (W3Schools Style)
+# ---------------------------------------------------------------------------
+
+DISTANCE_THRESHOLD = 0.8
+
+NOT_ENOUGH_INFO_MESSAGE = (
+    "I don't have enough information to answer this based on the provided sources."
+)
+
+INSUFFICIENT_CONTEXT_NOTICE = (
+    "### ⚠️ Insufficient Context\n\n"
+    "No relevant content found in the knowledge base for this topic or source. "
+    "Please ensure the target URL was successfully indexed and contains extractable text."
+)
+
+YOUTUBE_NOT_INDEXED_WARNING = (
+    "YouTube transcript unavailable or disabled for this video. "
+    "The URL was NOT indexed into the knowledge base."
+)
+
+# Custom W3Schools Theme & CSS
+w3_theme = gr.themes.Default(
+    primary_hue=gr.themes.colors.emerald,
+    neutral_hue=gr.themes.colors.slate,
+    font=[gr.themes.GoogleFont("Source Sans Pro"), "ui-sans-serif", "sans-serif"],
+).set(
+    button_primary_background_fill="#04AA6D",
+    button_primary_background_fill_hover="#059862",
+    button_primary_text_color="#ffffff",
+    border_color_primary="#04AA6D",
+)
+
+custom_css = """
+.primary-btn {
+    background-color: #04AA6D !important;
+    color: white !important;
+    font-weight: 600;
+}
+.primary-btn:hover {
+    background-color: #059862 !important;
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# 1. RAG MANAGER INITIALIZATION
+# ---------------------------------------------------------------------------
+try:
+    rag = RAGManager(
+        collection_name="research_assistant_kb",
+        persist_directory="./chroma_db",
+        embedding_model="nomic-embed-text",
+        use_persistent_storage=True,
+    )
+    RAG_AVAILABLE = True
+except Exception as startup_error:
+    print(f"[STARTUP WARNING] Could not initialize RAGManager: {startup_error}")
+    rag = None
+    RAG_AVAILABLE = False
+
+
+def retrieve_context_with_fallback(query: str, k: int = 3, allowed_sources=None):
+    if not RAG_AVAILABLE:
+        return [], False
+
+    try:
+        if rag.is_empty():
+            return [], False
+        good_chunks = rag.retrieve_relevant_context(
+            query,
+            k=k,
+            distance_threshold=DISTANCE_THRESHOLD,
+            allowed_sources=allowed_sources,
+        )
+    except Exception as e:
+        print(f"[RAG ERROR] retrieve_context failed: {e}")
+        return [], False
+
+    return good_chunks, bool(good_chunks)
+
+
+# ---------------------------------------------------------------------------
+# 2. VALIDATION HELPERS
 # ---------------------------------------------------------------------------
 
 def validate_url_placeholder(url: str) -> bool:
-    """
-    PLACEHOLDER: Will later perform real URL validation
-    (scheme check, reachability check, timeout handling, etc.).
-    For now, just a naive check so the UI has something to call.
-    """
-    if not url:
-        return True  # empty is allowed (URL field is optional)
-    return url.startswith("http://") or url.startswith("https://")
+    if not url or not url.strip():
+        return False
+    clean = url.strip()
+    return clean.startswith("http://") or clean.startswith("https://")
 
+
+# ---------------------------------------------------------------------------
+# 3. HANDLER FUNCTIONS
+# ---------------------------------------------------------------------------
 
 def run_chat_turn(user_message, chat_history, progress=gr.Progress()):
-    """
-    PLACEHOLDER for the chatbot's "Send" action.
-
-    In future steps this function will:
-        - Route the query through the RAG pipeline (ChromaDB retrieval).
-        - Fall back to "I don't have enough information" when
-          similarity scores are too low.
-        - Call the local Ollama model for generation.
-
-    For now, it only simulates the pipeline stages using gr.Progress()
-    and gr.Info() so the team can see how status indicators work.
-    """
     if not user_message or not user_message.strip():
         gr.Warning("Please enter a research question before sending.")
         return chat_history, ""
 
-    # --- Simulated pipeline stages (to be replaced with real logic) ---
-    progress(0, desc="Starting...")
-    gr.Info("Searching knowledge base...")
-    time.sleep(0.5)
-    progress(0.33, desc="Searching...")
+    user_message = user_message.strip()
+    answer = NOT_ENOUGH_INFO_MESSAGE
 
-    gr.Info("Retrieving relevant context...")
-    time.sleep(0.5)
-    progress(0.66, desc="Analyzing...")
+    try:
+        progress(0, desc="Checking local knowledge base...")
+        good_chunks, has_context = retrieve_context_with_fallback(user_message, k=3)
 
-    gr.Info("Generating answer with local model...")
-    time.sleep(0.5)
-    progress(1.0, desc="Done")
+        if has_context:
+            gr.Info(f"Found {len(good_chunks)} relevant chunk(s) in your indexed sources.")
+            context_block = "\n\n".join(
+                f"[Source: {c['source']}]\n{c['text']}" for c in good_chunks
+            )
+            agent_prompt = (
+                "Relevant context from the local knowledge base:\n\n"
+                f"{context_block}\n\n"
+                f"User question: {user_message}\n\n"
+                "Use the context above if it answers the question. If it doesn't "
+                "fully answer it, use your tools (web search, scraping) to find "
+                "more current or complete information. Never invent facts that "
+                "aren't in the context or in your tool results."
+            )
+        else:
+            gr.Info("Nothing relevant found locally — researching live sources...")
+            agent_prompt = user_message
 
-    dummy_answer = (
-        f"[DUMMY RESPONSE] This is a placeholder answer to: '{user_message}'. "
-        f"Real RAG + Ollama generation will be wired in during the next step."
-    )
+        progress(0.4, desc="Running research agent...")
+        result = agent_backend.run_agent(agent_prompt)
+        progress(1.0, desc="Done")
 
-    # gr.Chatbot expects a list of (user, bot) tuples for its history
-    chat_history = chat_history + [(user_message, dummy_answer)]
+        if isinstance(result, dict) and "error" in result:
+            answer = f"Sorry, the research agent hit an error: {result['error']}"
+        elif result and str(result).strip():
+            answer = str(result)
 
-    return chat_history, ""  # clear the textbox after sending
+    except Exception as e:
+        traceback.print_exc()
+        gr.Warning(f"Something went wrong while answering: {e}")
+        answer = "Sorry, an internal error occurred while processing your question."
+
+    chat_history = chat_history + [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": answer},
+    ]
+    return chat_history, ""
 
 
 def add_url_placeholder(url_input, url_list_state, progress=gr.Progress()):
-    """
-    PLACEHOLDER for adding a manual URL to the knowledge source list.
-
-    In future steps this function will:
-        - Validate the URL (format + reachability + timeout).
-        - Scrape/fetch content.
-        - Chunk it (LangChain text splitters) and embed it into ChromaDB.
-
-    For now, it only validates the format and simulates scraping.
-    """
     if not url_input or not url_input.strip():
         gr.Warning("Please enter a URL first.")
         return url_list_state, gr.update(value="")
 
-    if not validate_url_placeholder(url_input.strip()):
+    url_input = url_input.strip()
+
+    if not validate_url_placeholder(url_input):
         gr.Warning(f"'{url_input}' does not look like a valid URL (must start with http:// or https://).")
         return url_list_state, gr.update(value=url_input)
 
-    progress(0, desc="Validating URL...")
-    time.sleep(0.3)
-    gr.Info(f"Scraping content from: {url_input}")
-    progress(0.5, desc="Scraping...")
-    time.sleep(0.5)
+    if not RAG_AVAILABLE:
+        gr.Warning("Knowledge base is offline (Ollama/embeddings unreachable). Check setup.")
+        return url_list_state, gr.update(value=url_input)
 
-    gr.Info("Chunking and indexing content...")
-    progress(1.0, desc="Indexed")
-    time.sleep(0.3)
+    try:
+        progress(0, desc="Fetching page...")
+        scrape_result = agent_backend.scrape_page(url_input)
 
-    url_list_state = url_list_state + [url_input.strip()]
-    gr.Info(f"Added source ({len(url_list_state)} total). ")
+        is_youtube = agent_backend.is_youtube_url(url_input)
+        scraped_text = (scrape_result.get("content") or "").strip()
+        scrape_failed = (
+            "error" in scrape_result
+            or scrape_result.get("skipped_ingestion")
+            or not scraped_text
+            or scraped_text.startswith("[Warning:")
+        )
 
-    # Clear the textbox, and return updated state for display
+        if scrape_failed:
+            if is_youtube:
+                gr.Warning(YOUTUBE_NOT_INDEXED_WARNING)
+            else:
+                gr.Warning(
+                    f"Failed to fetch content from {url_input}. "
+                    "Nothing was added to the knowledge base."
+                )
+            return url_list_state, gr.update(value=url_input)
+
+        progress(0.5, desc="Chunking and indexing content...")
+        num_chunks = rag.add_documents(scraped_text, source_url=url_input)
+        progress(1.0, desc="Indexed")
+
+        if not num_chunks:
+            gr.Warning(
+                f"Failed to fetch content from {url_input}. "
+                "Nothing was added to the knowledge base."
+            )
+            return url_list_state, gr.update(value=url_input)
+
+        url_list_state = url_list_state + [url_input]
+        gr.Info(f"Successfully indexed: {url_input} ({num_chunks} chunks added)")
+
+    except ValueError as e:
+        if agent_backend.is_youtube_url(url_input):
+            gr.Warning(YOUTUBE_NOT_INDEXED_WARNING)
+        else:
+            gr.Warning(
+                f"Failed to fetch content from {url_input}. "
+                "Nothing was added to the knowledge base."
+            )
+        print(e)
+        return url_list_state, gr.update(value=url_input)
+    except Exception as e:
+        traceback.print_exc()
+        gr.Warning(f"Unexpected error while adding source: {e}")
+        return url_list_state, gr.update(value=url_input)
+
     return url_list_state, gr.update(value="")
 
 
 def generate_report_placeholder(topic, url_list_state, progress=gr.Progress()):
-    """
-    PLACEHOLDER for the "Generate Report" action.
-
-    In future steps this function will:
-        - Run similarity retrieval over ChromaDB for the given topic.
-        - Aggregate retrieved chunks + any manually added URLs.
-        - Prompt the local Ollama model to produce a structured report.
-        - Return "I don't have enough information about this topic."
-          when retrieval confidence is too low.
-
-    For now, it just simulates the stages and returns dummy Markdown.
-    """
     if not topic or not topic.strip():
         gr.Warning("Please enter a research topic before generating a report.")
         return "*No report generated yet.*"
 
-    progress(0, desc="Starting report generation...")
-    gr.Info("Searching indexed sources...")
-    time.sleep(0.5)
-    progress(0.4, desc="Searching...")
+    topic = topic.strip()
 
-    gr.Info("Analyzing retrieved content...")
-    time.sleep(0.5)
-    progress(0.8, desc="Analyzing...")
+    if not RAG_AVAILABLE:
+        gr.Warning("Knowledge base is offline (Ollama/embeddings unreachable).")
+        return "*Report unavailable — knowledge base is offline.*"
 
-    gr.Info("Compiling structured report...")
-    time.sleep(0.4)
-    progress(1.0, desc="Done")
+    try:
+        progress(0, desc="Searching indexed sources...")
+        kb_empty = rag.is_empty()
+        good_chunks, has_context = retrieve_context_with_fallback(
+            topic,
+            k=6,
+            allowed_sources=url_list_state or [],
+        )
 
-    sources_note = (
-        f"\n\n**Sources used:** {len(url_list_state)} manual URL(s) + indexed documents."
-        if url_list_state else "\n\n**Sources used:** No manual URLs added; using indexed documents only."
-    )
+        if kb_empty or not has_context or not url_list_state:
+            gr.Warning(
+                "No relevant indexed content for this topic. "
+                "The report was not generated from leftover knowledge-base data."
+            )
+            return INSUFFICIENT_CONTEXT_NOTICE
 
-    dummy_report = (
-        f"## Research Report: {topic}\n\n"
-        f"*(This is placeholder content. Real content will come from the "
-        f"RAG pipeline + Ollama in a later step.)*\n\n"
-        f"### Summary\n"
-        f"- Point 1 about {topic}\n"
-        f"- Point 2 about {topic}\n"
-        f"- Point 3 about {topic}\n"
-        f"{sources_note}"
-    )
-    return dummy_report
+        progress(0.4, desc="Compiling sources for report...")
+        sources_text = "\n\n".join(
+            f"SOURCE URL:\n{c['source']}\n\nSOURCE CONTENT:\n{c['text']}"
+            for c in good_chunks
+        )
+
+        gr.Info("Generating structured report...")
+        progress(0.8, desc="Generating structured report...")
+        result = agent_backend.generate_report(sources_text)
+        progress(1.0, desc="Done")
+
+        if "error" in result:
+            gr.Warning(f"Report generation failed: {result['error']}")
+            return f"*Report generation failed: {result['error']}*"
+
+        sources_note = (
+            f"\n\n**Sources used:** {len(url_list_state)} manual URL(s) added, "
+            f"{len(good_chunks)} indexed chunk(s) matched this topic "
+            f"(distance threshold: {DISTANCE_THRESHOLD})."
+        )
+        return result["report"] + sources_note
+
+    except Exception as e:
+        traceback.print_exc()
+        gr.Warning(f"Unexpected error while generating report: {e}")
+        return "*An internal error occurred while generating the report.*"
 
 
 def clear_chat():
-    """Resets the chatbot history and input box."""
     return [], ""
 
 
+def clear_knowledge_base(url_list_state):
+    if not RAG_AVAILABLE:
+        gr.Warning("Knowledge base is offline (Ollama/embeddings unreachable).")
+        return url_list_state or []
+
+    try:
+        rag.reset_knowledge_base()
+        gr.Info("Knowledge base has been cleared.")
+        return []
+    except Exception as e:
+        traceback.print_exc()
+        gr.Warning(f"Failed to clear knowledge base: {e}")
+        return url_list_state or []
+
+
 # ---------------------------------------------------------------------------
-# 2. GRADIO UI LAYOUT
+# 4. GRADIO UI LAYOUT
 # ---------------------------------------------------------------------------
 
-with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
-
+with gr.Blocks(title="AI Research Assistant", css=custom_css) as demo:
     gr.Markdown(
         """
         # 🔎 AI Research Assistant
         Ask research questions, add reference URLs, and generate a structured report.
-        *(Backend logic is a placeholder for now — RAG + Ollama integration comes next.)*
+        Backed by local Ollama models, ChromaDB retrieval, and web research tools.
         """
     )
 
-    # --- STATE ---
-    # chat_history_state: list of (user, bot) tuples, used by gr.Chatbot
-    # url_list_state: list of manually added URLs (will feed into RAG indexing later)
     chat_history_state = gr.State([])
     url_list_state = gr.State([])
 
     with gr.Row():
-
-        # ------------------ LEFT COLUMN: Chat Interface ------------------
         with gr.Column(scale=2):
             gr.Markdown("### 💬 Chat")
-
             chatbot = gr.Chatbot(
                 label="Research Assistant Chat",
                 height=420,
-                show_copy_button=True,
+                type="messages",
             )
-
             with gr.Row():
                 query_input = gr.Textbox(
                     label="Research Question",
@@ -214,15 +340,14 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
 
             clear_btn = gr.Button("🗑️ Clear Chat", size="sm")
 
-        # ------------------ RIGHT COLUMN: Sources + Report ------------------
         with gr.Column(scale=1):
             gr.Markdown("### 🔗 Manual Source URLs")
-
             url_input = gr.Textbox(
                 label="Add a URL",
                 placeholder="https://example.com/article",
             )
             add_url_btn = gr.Button("➕ Add URL")
+            clear_kb_btn = gr.Button("🗑️ Clear Knowledge Base", size="sm")
 
             url_display = gr.Markdown(
                 value="_No URLs added yet._",
@@ -230,7 +355,6 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
             )
 
             gr.Markdown("### 📄 Generate Structured Report")
-
             topic_input = gr.Textbox(
                 label="Report Topic",
                 placeholder="e.g., Impact of AI on renewable energy research",
@@ -243,18 +367,15 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
             )
 
     # -----------------------------------------------------------------
-    # 3. EVENT WIRING
-    #    Each control is connected to its corresponding placeholder
-    #    function. Only these function bodies need to change later.
+    # 5. EVENT WIRING
     # -----------------------------------------------------------------
 
-    # --- Chat send (button click + Enter key) ---
     send_btn.click(
         fn=run_chat_turn,
         inputs=[query_input, chat_history_state],
         outputs=[chat_history_state, query_input],
     ).then(
-        fn=lambda h: h,  # sync state -> visible chatbot component
+        fn=lambda h: h,
         inputs=chat_history_state,
         outputs=chatbot,
     )
@@ -269,7 +390,6 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
         outputs=chatbot,
     )
 
-    # --- Clear chat ---
     clear_btn.click(
         fn=clear_chat,
         inputs=None,
@@ -280,9 +400,7 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
         outputs=chatbot,
     )
 
-    # --- Add URL ---
     def refresh_url_display(url_list):
-        """Small helper to render the current URL list as Markdown bullets."""
         if not url_list:
             return "_No URLs added yet._"
         return "\n".join(f"- {u}" for u in url_list)
@@ -297,7 +415,16 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
         outputs=url_display,
     )
 
-    # --- Generate report ---
+    clear_kb_btn.click(
+        fn=clear_knowledge_base,
+        inputs=[url_list_state],
+        outputs=[url_list_state],
+    ).then(
+        fn=refresh_url_display,
+        inputs=url_list_state,
+        outputs=url_display,
+    )
+
     generate_report_btn.click(
         fn=generate_report_placeholder,
         inputs=[topic_input, url_list_state],
@@ -306,8 +433,8 @@ with gr.Blocks(title="AI Research Assistant", theme=gr.themes.Soft()) as demo:
 
 
 # ---------------------------------------------------------------------------
-# 4. LAUNCH
+# 6. LAUNCH
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    demo.queue()  # required for gr.Progress() / streaming-style updates
-    demo.launch()
+    demo.queue()
+    demo.launch(theme=w3_theme)

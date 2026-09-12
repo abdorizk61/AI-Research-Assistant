@@ -1,3 +1,4 @@
 gradio
 chromadb
 langchain-text-splitters
+youtube-transcript-api

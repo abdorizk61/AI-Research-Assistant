@@ -1,10 +1,13 @@
+import json
+from urllib.parse import parse_qs, urlparse
+
 import ollama
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
 
-MODEL = "qwen-local"
+MODEL = "qwen2.5:3b"
 
 MAX_SEARCH_RESULTS = 3
 MAX_SEARCH_BODY = 150
@@ -13,7 +16,11 @@ MAX_SUMMARY_CHARS = 2500
 MAX_COMPARE_SOURCE_CHARS = 1800
 MAX_REPORT_SOURCE_CHARS = 7000
 MAX_TOOL_RESULT_CHARS = 3500
-MAX_ITERATIONS = 6
+MAX_ITERATIONS = 3
+YOUTUBE_SKIP_MESSAGE = (
+    "[Warning: Direct YouTube scraping requires transcript extraction; "
+    "skipped raw HTML ingestion]"
+)
 
 
 def search_web(query):
@@ -48,7 +55,102 @@ def search_web(query):
     return results
 
 
+def is_youtube_url(url):
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+
+    host = host[4:] if host.startswith("www.") else host
+    return (
+        host == "youtu.be"
+        or host.endswith("youtube.com")
+        or host.endswith("youtube-nocookie.com")
+    )
+
+
+def extract_youtube_video_id(url):
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+
+    host = parsed.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+
+    if host == "youtu.be":
+        video_id = parsed.path.lstrip("/").split("/")[0]
+        return video_id or None
+
+    query_id = parse_qs(parsed.query).get("v", [None])[0]
+    if query_id:
+        return query_id
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0] in {"embed", "shorts", "live", "v"}:
+        return parts[1]
+
+    return None
+
+
+def fetch_youtube_transcript(video_id):
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        return None
+
+    snippets = None
+
+    try:
+        if hasattr(YouTubeTranscriptApi, "get_transcript"):
+            snippets = YouTubeTranscriptApi.get_transcript(video_id)
+        else:
+            fetched = YouTubeTranscriptApi().fetch(video_id)
+            if hasattr(fetched, "to_raw_data"):
+                snippets = fetched.to_raw_data()
+            else:
+                snippets = fetched
+    except Exception:
+        return None
+
+    if not snippets:
+        return None
+
+    texts = []
+    for snippet in snippets:
+        if isinstance(snippet, dict):
+            texts.append(snippet.get("text", ""))
+        else:
+            texts.append(getattr(snippet, "text", "") or "")
+
+    transcript = " ".join(part for part in texts if part).strip()
+    return transcript or None
+
+
 def scrape_page(url):
+    if not url or not str(url).strip():
+        return {
+            "error": "No URL was provided for scraping."
+        }
+
+    url = str(url).strip()
+
+    if is_youtube_url(url):
+        video_id = extract_youtube_video_id(url)
+        transcript = fetch_youtube_transcript(video_id) if video_id else None
+
+        if transcript:
+            return {
+                "url": url,
+                "content": transcript[:MAX_SCRAPE_CHARS]
+            }
+
+        return {
+            "url": url,
+            "content": YOUTUBE_SKIP_MESSAGE,
+            "skipped_ingestion": True
+        }
+
     try:
         response = requests.get(
             url,
@@ -91,6 +193,14 @@ def scrape_page(url):
             "content": text[:MAX_SCRAPE_CHARS]
         }
 
+    except requests.Timeout:
+        return {
+            "error": "Could not scrape page: request timed out after 10 seconds."
+        }
+    except requests.RequestException as error:
+        return {
+            "error": f"Could not scrape page: {error}"
+        }
     except Exception as error:
         return {
             "error": f"Could not scrape page: {error}"
@@ -421,8 +531,63 @@ REPORT RULE:
 """
 
 
+def _normalize_arguments(arguments):
+    if arguments is None:
+        return {}
+
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {}
+
+    if not isinstance(arguments, dict):
+        return {}
+
+    return arguments
+
+
+def _extract_tool_calls(response):
+    message = getattr(response, "message", None)
+
+    if message is None and isinstance(response, dict):
+        message = response.get("message")
+
+    if message is None:
+        return None, []
+
+    tool_calls = getattr(message, "tool_calls", None)
+
+    if tool_calls is None and isinstance(message, dict):
+        tool_calls = message.get("tool_calls")
+    elif tool_calls is None and hasattr(message, "get"):
+        tool_calls = message.get("tool_calls")
+
+    return message, tool_calls or []
+
+
+def _parse_tool_call(tool_call):
+    function = getattr(tool_call, "function", None)
+
+    if function is None and isinstance(tool_call, dict):
+        function = tool_call.get("function", {})
+
+    if function is None:
+        return None, {}
+
+    name = getattr(function, "name", None)
+    if name is None and isinstance(function, dict):
+        name = function.get("name")
+
+    arguments = getattr(function, "arguments", None)
+    if arguments is None and isinstance(function, dict):
+        arguments = function.get("arguments", {})
+
+    return name, _normalize_arguments(arguments)
+
+
 def execute_tool(tool_name, arguments):
-    if tool_name == "search_web":
+    if tool_name in ("search_web", "web_search"):
         return search_web(
             arguments.get("query", "")
         )
@@ -495,17 +660,18 @@ def run_agent(user_prompt):
                 "error": str(error)
             }
 
-        assistant_message = response["message"]
-
-        tool_calls = assistant_message.get(
-            "tool_calls"
-        )
+        assistant_message, tool_calls = _extract_tool_calls(response)
 
         if not tool_calls:
-            final_answer = assistant_message.get(
-                "content",
-                ""
-            )
+            final_answer = ""
+            if assistant_message is not None:
+                final_answer = getattr(
+                    assistant_message,
+                    "content",
+                    None
+                )
+                if final_answer is None and hasattr(assistant_message, "get"):
+                    final_answer = assistant_message.get("content", "")
 
             print()
             print(
@@ -513,7 +679,7 @@ def run_agent(user_prompt):
             )
             print(final_answer)
 
-            return final_answer
+            return final_answer or ""
 
         messages.append(
             assistant_message
@@ -523,14 +689,16 @@ def run_agent(user_prompt):
         report_result = None
 
         for tool_call in tool_calls:
-            function = tool_call["function"]
+            tool_name, arguments = _parse_tool_call(tool_call)
 
-            tool_name = function["name"]
-
-            arguments = function.get(
-                "arguments",
-                {}
-            )
+            if not tool_name:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": "Unknown tool call could not be parsed."
+                    }
+                )
+                continue
 
             print(
                 f"Tool call: {tool_name}"
@@ -540,92 +708,98 @@ def run_agent(user_prompt):
                 f"Arguments: {arguments}"
             )
 
-            if tool_name == "compare_sources":
-                if len(scraped_sources) >= 2:
-                    first_source = scraped_sources[0]
-                    second_source = scraped_sources[1]
+            try:
+                if tool_name == "compare_sources":
+                    if len(scraped_sources) >= 2:
+                        first_source = scraped_sources[0]
+                        second_source = scraped_sources[1]
 
-                    first_content = first_source.get(
-                        "content",
-                        ""
-                    )
-
-                    second_content = second_source.get(
-                        "content",
-                        ""
-                    )
-
-                    tool_result = compare_sources(
-                        first_content,
-                        second_content
-                    )
-                else:
-                    tool_result = {
-                        "error": (
-                            "At least two successfully "
-                            "scraped sources are required "
-                            "before comparison."
+                        first_content = first_source.get(
+                            "content",
+                            ""
                         )
-                    }
 
-            elif tool_name == "generate_report":
-                research_package_parts = []
+                        second_content = second_source.get(
+                            "content",
+                            ""
+                        )
 
-                for source in scraped_sources:
-                    source_url = source.get(
-                        "url",
-                        ""
-                    )
+                        tool_result = compare_sources(
+                            first_content,
+                            second_content
+                        )
+                    else:
+                        tool_result = {
+                            "error": (
+                                "At least two successfully "
+                                "scraped sources are required "
+                                "before comparison."
+                            )
+                        }
 
-                    source_content = source.get(
-                        "content",
-                        ""
-                    )
+                elif tool_name == "generate_report":
+                    research_package_parts = []
 
-                    research_package_parts.append(
-                        f"""
+                    for source in scraped_sources:
+                        source_url = source.get(
+                            "url",
+                            ""
+                        )
+
+                        source_content = source.get(
+                            "content",
+                            ""
+                        )
+
+                        research_package_parts.append(
+                            f"""
 SOURCE URL:
 {source_url}
 
 SOURCE CONTENT:
 {source_content}
 """
-                    )
+                        )
 
-                for comparison in comparison_results:
-                    research_package_parts.append(
-                        f"""
+                    for comparison in comparison_results:
+                        research_package_parts.append(
+                            f"""
 COMPARISON:
 
 {comparison}
 """
+                        )
+
+                    research_package = "\n".join(
+                        research_package_parts
                     )
 
-                research_package = "\n".join(
-                    research_package_parts
-                )
+                    if not research_package.strip():
+                        research_package = arguments.get(
+                            "sources",
+                            ""
+                        )
 
-                if not research_package.strip():
-                    research_package = arguments.get(
-                        "sources",
-                        ""
+                    tool_result = generate_report(
+                        research_package
                     )
 
-                tool_result = generate_report(
-                    research_package
-                )
-
-            else:
-                tool_result = execute_tool(
-                    tool_name,
-                    arguments
-                )
+                else:
+                    tool_result = execute_tool(
+                        tool_name,
+                        arguments
+                    )
+            except Exception as tool_error:
+                tool_result = {
+                    "error": f"Tool execution error: {tool_error}"
+                }
 
             if tool_name == "scrape_page":
                 if (
                     isinstance(tool_result, dict)
                     and "content" in tool_result
                     and "url" in tool_result
+                    and not tool_result.get("skipped_ingestion")
                 ):
                     scraped_sources.append(
                         {
@@ -667,6 +841,7 @@ COMPARISON:
             messages.append(
                 {
                     "role": "tool",
+                    "tool_name": tool_name,
                     "content": tool_result_text
                 }
             )
@@ -688,24 +863,28 @@ COMPARISON:
 
             return report_result
 
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Continue the research task "
-                    "using the tool results above. "
-                    "Follow the user's original request. "
-                    "If a research report is requested "
-                    "and enough information has been "
-                    "collected, generate the report."
-                )
-            }
-        )
-
     print()
     print(
         "--- MAX ITERATIONS REACHED ---"
     )
+
+    try:
+        final_response = ollama.chat(
+            model=MODEL,
+            messages=messages
+        )
+        final_message, _ = _extract_tool_calls(final_response)
+        final_answer = ""
+        if final_message is not None:
+            final_answer = getattr(final_message, "content", None)
+            if final_answer is None and hasattr(final_message, "get"):
+                final_answer = final_message.get("content", "")
+        if final_answer and str(final_answer).strip():
+            return final_answer
+    except Exception as error:
+        return {
+            "error": str(error)
+        }
 
     return {
         "error": (
