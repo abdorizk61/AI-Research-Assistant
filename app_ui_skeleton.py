@@ -310,7 +310,7 @@ def clear_knowledge_base(url_list_state):
 # 4. GRADIO UI LAYOUT
 # ---------------------------------------------------------------------------
 
-with gr.Blocks(title="AI Research Assistant", css=custom_css) as demo:
+with gr.Blocks(title="AI Research Assistant") as demo:
     gr.Markdown(
         """
         # 🔎 AI Research Assistant
@@ -328,7 +328,6 @@ with gr.Blocks(title="AI Research Assistant", css=custom_css) as demo:
             chatbot = gr.Chatbot(
                 label="Research Assistant Chat",
                 height=420,
-                type="messages",
             )
             with gr.Row():
                 query_input = gr.Textbox(
@@ -438,3 +437,4 @@ with gr.Blocks(title="AI Research Assistant", css=custom_css) as demo:
 if __name__ == "__main__":
     demo.queue()
     demo.launch(theme=w3_theme)
+    demo.launch(css=custom_css)
